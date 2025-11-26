@@ -1,129 +1,306 @@
-const express = require("express");
-const cors = require("cors");
-const fs = require("fs");
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+
 const app = express();
+const port = process.env.PORT || 3000;
+const dataFilePath = path.join(__dirname, 'data.json');
+
+// Middleware (Security & Data Parsing)
 app.use(cors());
-app.use(express.json());
-const PORT = process.env.PORT || 3000;
-const ASSETS = ["BTC","ETH","USDT","SOL","BNB","DOGE","LTC","USDC"];
-// persistent data file
-const DATA_FILE = "data.json";
-let state = { wallets: {} };
-// load if exists
-try {
-  if (fs.existsSync(DATA_FILE)) {
-    const raw = fs.readFileSync(DATA_FILE);
-    state = JSON.parse(raw);
-  }
-} catch (e) {
-  console.error("Failed to load data file", e);
-}
-function save() {
-  try { fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2)); } catch (e) {}
-}
-function randHex40() {
-  const chars = "abcdef0123456789";
-  let s = "0x";
-  for (let i=0;i<40;i++) s += chars[Math.floor(Math.random()*chars.length)];
-  return s;
-}
-function createWallet(name) {
-  const id = randHex40();
-  const addresses = {};
-  ASSETS.forEach(a => { addresses[a] = randHex40(); });
-  const balances = {};
-  ASSETS.forEach(a => balances[a] = 0);
-  const w = { id, name, addresses, balances, transactions: [] };
-  state.wallets[id] = w;
-  save();
-  return w;
-}
-app.get("/", (req,res) => res.json({ ok: true, message: "Wallet backend running" }));
-app.post("/register", (req,res) => {
-  const name = req.body.name || "Unnamed";
-  const pin = req.body.pin || null;
-  const w = createWallet(name);
-  if (pin) w.pin = pin;
-  save();
-  return res.json({ success: true, wallet: w });
-});
-app.get("/wallet/:id", (req,res) => {
-  const id = req.params.id;
-  const w = state.wallets[id];
-  if (!w) return res.status(404).json({ success:false, error:"Wallet not found" });
-  return res.json({ success:true, wallet: w });
-});
-app.get("/wallet-by-address/:addr", (req,res) => {
-  const addr = req.params.addr;
-  for (const id in state.wallets) {
-    const w = state.wallets[id];
-    if (Object.values(w.addresses).includes(addr)) {
-      return res.json({ success:true, wallet: w });
+app.use(bodyParser.json());
+
+// --- Helper Functions (Database Handling) ---
+
+// Data read karne ke liye
+function readData() {
+    try {
+        if (!fs.existsSync(dataFilePath)) {
+            // Agar file nahi hai to create karo default data ke saath
+            const defaultData = { users: [], adminPin: "2626" };
+            fs.writeFileSync(dataFilePath, JSON.stringify(defaultData, null, 2));
+            return defaultData;
+        }
+        const data = fs.readFileSync(dataFilePath, 'utf8');
+        return JSON.parse(data);
+    } catch (error) {
+        console.error("Database Read Error:", error);
+        return { users: [], adminPin: "2626" };
     }
-  }
-  return res.status(404).json({ success:false, error:"Wallet not found" });
-});
-app.post("/admin/credit", (req,res) => {
-  const { address, asset, amount } = req.body;
-  // find wallet by id or address
-  let w = state.wallets[address] || null;
-  if (!w) {
-    for (const id in state.wallets) {
-      if (Object.values(state.wallets[id].addresses).includes(address)) { w = state.wallets[id]; break; }
+}
+
+// Data save karne ke liye
+function writeData(data) {
+    try {
+        fs.writeFileSync(dataFilePath, JSON.stringify(data, null, 2));
+    } catch (error) {
+        console.error("Database Write Error:", error);
     }
-  }
-  if (!w) return res.status(404).json({ success:false, error:"Wallet not found" });
-  if (!ASSETS.includes(asset)) return res.status(400).json({ success:false, error:"Unknown asset" });
-  const amt = parseFloat(amount);
-  if (isNaN(amt) || amt <= 0) return res.status(400).json({ success:false, error:"Invalid amount" });
-  w.balances[asset] += amt;
-  const tx = { type:"ADMIN_CREDIT", asset, amount: amt, time: new Date().toISOString() };
-  w.transactions.push(tx);
-  save();
-  return res.json({ success:true, wallet: w });
+}
+
+// --- 🚀 APP USER ROUTES ---
+
+// 1. Initialize Account (First Time Open)
+app.post('/api/init', (req, res) => {
+    const { userId, pin, wallets } = req.body;
+
+    if (!userId || !pin || !wallets) {
+        return res.status(400).json({ success: false, message: 'Invalid data provided.' });
+    }
+
+    const db = readData();
+
+    // Check if user already exists
+    if (db.users.find(u => u.userId === userId)) {
+        return res.json({ success: true, message: 'User already exists.' });
+    }
+
+    // Prepare Assets Structure (Starts with 0 balance mostly, maybe some bonus)
+    const assets = {};
+    // Loop through all wallets sent by frontend (BTC, ETH, TRX, etc.)
+    for (const [symbol, address] of Object.entries(wallets)) {
+        assets[symbol] = {
+            address: address,
+            balance: 0.00 // Default balance zero
+        };
+    }
+    
+    // Welcome Bonus for testing (Optional - remove if not needed)
+    if(assets['BTC']) assets['BTC'].balance = 0.005; 
+    if(assets['TRX']) assets['TRX'].balance = 50.0;
+
+    const newUser = {
+        userId,
+        pin, 
+        assets,
+        transactions: [],
+        isFrozen: false,
+        createdAt: new Date().toISOString()
+    };
+
+    db.users.push(newUser);
+    writeData(db);
+
+    console.log(`New User Registered: ${userId}`);
+    res.json({ success: true, message: 'Wallet initialized successfully.' });
 });
-app.post("/send", (req,res) => {
-  const { from, to, asset, amount } = req.body;
-  const fromW = state.wallets[from] || null;
-  if (!fromW) return res.status(404).json({ success:false, error:"Sender wallet not found" });
-  if (!ASSETS.includes(asset)) return res.status(400).json({ success:false, error:"Unknown asset" });
-  const amt = parseFloat(amount);
-  if (isNaN(amt) || amt <= 0) return res.status(400).json({ success:false, error:"Invalid amount" });
-  if (fromW.balances[asset] < amt) return res.status(400).json({ success:false, error:"Insufficient balance" });
-  // find recipient by address
-  let toW = null;
-  for (const id in state.wallets) {
-    if (Object.values(state.wallets[id].addresses).includes(to)) { toW = state.wallets[id]; break; }
-  }
-  if (!toW) return res.status(404).json({ success:false, error:"Recipient wallet not found" });
-  fromW.balances[asset] -= amt;
-  toW.balances[asset] += amt;
-  const tx = { type:"TRANSFER", asset, amount: amt, from: fromW.id, to: toW.id, time: new Date().toISOString() };
-  fromW.transactions.push(tx);
-  toW.transactions.push(tx);
-  save();
-  return res.json({ success:true, tx });
+
+// 2. Login (PIN Verification)
+app.post('/api/login', (req, res) => {
+    const { userId, pin } = req.body;
+    const db = readData();
+    const user = db.users.find(u => u.userId === userId);
+
+    if (!user) return res.json({ success: false, message: 'User not found.' });
+    
+    // Check Freeze Status
+    if (user.isFrozen) {
+        return res.json({ success: false, message: 'Account Frozen by Admin. Contact Support.' });
+    }
+
+    if (user.pin === pin) {
+        res.json({ success: true, message: 'Login successful.' });
+    } else {
+        res.json({ success: false, message: 'Incorrect PIN.' });
+    }
 });
-app.post("/set-pin", (req,res) => {
-  const { walletId, pin } = req.body;
-  const w = state.wallets[walletId];
-  if (!w) return res.status(404).json({ success:false, error:"Wallet not found" });
-  w.pin = pin;
-  save();
-  return res.json({ success:true, message:"PIN set" });
+
+// 3. Get User Data (Portfolio)
+app.post('/api/get-user-data', (req, res) => {
+    const { userId } = req.body;
+    const db = readData();
+    const user = db.users.find(u => u.userId === userId);
+
+    if (!user) return res.json({ success: false, message: 'User not found.' });
+
+    res.json({ success: true, data: { userId: user.userId, assets: user.assets } });
 });
-app.post("/verify-pin", (req,res) => {
-  const { walletId, pin } = req.body;
-  const w = state.wallets[walletId];
-  if (!w) return res.status(404).json({ success:false, error:"Wallet not found" });
-  return res.json({ success: w.pin === pin });
+
+// 4. Get Transactions History
+app.post('/api/get-transactions', (req, res) => {
+    const { userId } = req.body;
+    const db = readData();
+    const user = db.users.find(u => u.userId === userId);
+
+    if (!user) return res.json({ success: false, message: 'User not found.' });
+
+    // Send transactions (newest first)
+    res.json({ success: true, transactions: user.transactions.reverse() });
 });
-app.post("/reset-pin", (req,res) => {
-  const { walletId, newPin } = req.body;
-  const w = state.wallets[walletId];
-  if (!w) return res.status(404).json({ success:false, error:"Wallet not found" });
-  w.pin = newPin;
-  save();
-  return res.json({ success:true, message:"PIN reset" });
+
+// 5. SEND MONEY Logic (The Core Feature)
+app.post('/api/send-asset', (req, res) => {
+    const { senderId, assetSymbol, receiverAddress, amount } = req.body;
+    const db = readData();
+
+    // Basic Validations
+    if (!amount || amount <= 0) return res.json({ success: false, message: 'Invalid amount.' });
+
+    const sender = db.users.find(u => u.userId === senderId);
+    if (!sender) return res.json({ success: false, message: 'Sender not found.' });
+
+    // Freeze Check
+    if (sender.isFrozen) return res.json({ success: false, message: 'Transaction Failed: Your wallet is frozen.' });
+
+    // Asset & Balance Check
+    const senderAsset = sender.assets[assetSymbol];
+    if (!senderAsset) return res.json({ success: false, message: 'Asset not supported.' });
+    if (senderAsset.balance < amount) return res.json({ success: false, message: `Insufficient ${assetSymbol} Balance.` });
+
+    // Receiver Address Validation (Bot Check)
+    let receiver = null;
+    let receiverAssetKey = null;
+
+    // Find user who has this address
+    for (const u of db.users) {
+        for (const [key, val] of Object.entries(u.assets)) {
+            if (val.address === receiverAddress) {
+                if (key === assetSymbol) {
+                    receiver = u;
+                    receiverAssetKey = key;
+                } else {
+                    return res.json({ success: false, message: `Invalid Address: This is a ${key} address, not ${assetSymbol}.` });
+                }
+            }
+        }
+    }
+
+    if (!receiver) return res.json({ success: false, message: 'Invalid Wallet Address. User does not exist in our database.' });
+
+    // --- EXECUTE TRANSACTION ---
+    const timestamp = new Date().toLocaleString();
+
+    // Deduct
+    sender.assets[assetSymbol].balance -= amount;
+    // Credit
+    receiver.assets[receiverAssetKey].balance += amount;
+
+    // Record for Sender
+    sender.transactions.push({
+        type: 'Send',
+        asset: assetSymbol,
+        amount: amount,
+        targetAddress: receiverAddress,
+        timestamp: timestamp
+    });
+
+    // Record for Receiver
+    receiver.transactions.push({
+        type: 'Receive',
+        asset: assetSymbol,
+        amount: amount,
+        targetAddress: senderAsset.address,
+        timestamp: timestamp
+    });
+
+    writeData(db);
+    res.json({ success: true, message: `Successfully sent ${amount} ${assetSymbol}.` });
 });
-app.listen(PORT, () => console.log("Wallet backend running on port", PORT));
+
+
+// --- 👮 ADMIN PANEL ROUTES (PIN: 2626) ---
+
+// Middleware to verify Admin PIN strictly
+const verifyAdmin = (req, res, next) => {
+    // Frontend should send this in query or body
+    const pin = req.query.adminPin || req.body.adminPin;
+    if (pin === "2626") {
+        next();
+    } else {
+        res.status(401).json({ success: false, message: 'Unauthorized Admin Access' });
+    }
+};
+
+// 6. Get All Users (For Admin Dashboard)
+app.get('/api/admin/users', verifyAdmin, (req, res) => {
+    const db = readData();
+    res.json({ success: true, users: db.users });
+});
+
+// 7. Freeze/Unfreeze Wallet
+app.post('/api/admin/freeze-wallet', verifyAdmin, (req, res) => {
+    const { userId, status } = req.body;
+    const db = readData();
+    const user = db.users.find(u => u.userId === userId);
+    
+    if (user) {
+        user.isFrozen = status;
+        writeData(db);
+        res.json({ success: true, message: `User ${status ? 'Frozen' : 'Unfrozen'} successfully.` });
+    } else {
+        res.json({ success: false, message: 'User not found.' });
+    }
+});
+
+// 8. Admin Credit Balance (Add Money)
+app.post('/api/admin/credit', verifyAdmin, (req, res) => {
+    const { userId, assetSymbol, amount } = req.body;
+    const db = readData();
+    const user = db.users.find(u => u.userId === userId);
+
+    if (user && user.assets[assetSymbol]) {
+        user.assets[assetSymbol].balance += parseFloat(amount);
+        
+        // Record Admin Transaction
+        user.transactions.push({
+            type: 'Admin Credit',
+            asset: assetSymbol,
+            amount: parseFloat(amount),
+            targetAddress: 'System Admin',
+            timestamp: new Date().toLocaleString()
+        });
+
+        writeData(db);
+        res.json({ success: true, message: 'Balance Added Successfully.' });
+    } else {
+        res.json({ success: false, message: 'User or Asset not found.' });
+    }
+});
+
+// 9. Admin Deduct Balance (Remove Money)
+app.post('/api/admin/deduct', verifyAdmin, (req, res) => {
+    const { userId, assetSymbol, amount } = req.body;
+    const db = readData();
+    const user = db.users.find(u => u.userId === userId);
+
+    if (user && user.assets[assetSymbol]) {
+        user.assets[assetSymbol].balance -= parseFloat(amount);
+        
+        user.transactions.push({
+            type: 'Admin Deduct',
+            asset: assetSymbol,
+            amount: parseFloat(amount),
+            targetAddress: 'System Admin',
+            timestamp: new Date().toLocaleString()
+        });
+
+        writeData(db);
+        res.json({ success: true, message: 'Balance Deducted Successfully.' });
+    } else {
+        res.json({ success: false, message: 'User or Asset not found.' });
+    }
+});
+
+// 10. Reset User PIN
+app.post('/api/admin/reset-pin', verifyAdmin, (req, res) => {
+    const { userId, newPin } = req.body;
+    const db = readData();
+    const user = db.users.find(u => u.userId === userId);
+
+    if (user) {
+        user.pin = newPin;
+        writeData(db);
+        res.json({ success: true, message: 'PIN Reset Successfully.' });
+    } else {
+        res.json({ success: false, message: 'User not found.' });
+    }
+});
+
+// Start Server
+app.listen(port, () => {
+    console.log(`🚀 Server running on port ${port}`);
+});
+
